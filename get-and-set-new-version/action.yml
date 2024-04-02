@@ -14,7 +14,7 @@ runs:
   using: "composite"
   steps:
     - run: |
-        echo "Current version in build.gradle: ${{ inputs.current_version }}"
+        echo "Current version: ${{ inputs.current_version }}"
         latest_version=$(curl -sH "Authorization: token ${{ inputs.github_token }}" "${{ inputs.package_url }}/versions" | jq -r '[.[]] | .[0].name')
         echo "Latest package version: $latest_version"
         
