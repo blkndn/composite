@@ -1,0 +1,33 @@
+name: 'Get and Set New Version'
+description: 'Fetches the latest version, compares, and sets the new version.'
+inputs:
+  github_token:
+    description: 'GitHub token for authentication.'
+    required: true
+  package_url:
+    description: 'URL to the package versions.'
+    required: true
+  current_version:
+    description: 'Current version of the package.'
+    required: true
+runs:
+  using: "composite"
+  steps:
+    - run: |
+        echo "Current version in build.gradle: ${{ inputs.current_version }}"
+        latest_version=$(curl -sH "Authorization: token ${{ inputs.github_token }}" "${{ inputs.package_url }}/versions" | jq -r '[.[]] | .[0].name')
+        echo "Latest package version: $latest_version"
+        
+        IFS='.' read -ra cv <<< "${{ inputs.current_version }}"
+        IFS='.' read -ra lv <<< "$latest_version"
+        
+        if [[ ${cv[0]} -gt ${lv[0]} ]] || [[ ${cv[0]} -eq ${lv[0]} && ${cv[1]} -gt ${lv[1]} ]] || [[ ${cv[0]} -eq ${lv[0]} && ${cv[1]} -eq ${lv[1]} && ${cv[2]} -gt ${lv[2]} ]]; then
+          new_version="${{ inputs.current_version }}"
+        else
+          new_version="${lv[0]}.${lv[1]}.$((lv[2]+1))"
+        fi
+        
+        echo "New version to be used: $new_version"
+        echo "NEW_VERSION=$new_version" >> $GITHUB_ENV
+      shell: bash
+      id: set_version
