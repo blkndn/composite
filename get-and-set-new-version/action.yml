@@ -15,8 +15,14 @@ runs:
   steps:
     - run: |
         echo "Current version: ${{ inputs.current_version }}"
-        latest_version=$(curl -sH "Authorization: token ${{ inputs.github_token }}" "${{ inputs.package_url }}/versions" | jq -r '[.[]] | .[0].name')
-        echo "Latest package version: $latest_version"
+        package_versions=$(curl -sH "Authorization: token ${{ inputs.github_token }}" "${{ inputs.package_url }}/versions")
+
+        if [[ $? -eq 0 ]] && echo "$package_versions" | jq -e '.[] | select(.name != null)' > /dev/null; then
+          latest_version=$(echo "$package_versions" | jq -r '[.[] | select(.name != null)] | .[0].name')
+        else
+          echo "Package not found or no valid versions available. Setting version to default."
+          latest_version="0.0.0"
+        fi
         
         IFS='.' read -ra cv <<< "${{ inputs.current_version }}"
         IFS='.' read -ra lv <<< "$latest_version"

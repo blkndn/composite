@@ -1,0 +1,53 @@
+name: Create new release
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4.1.2
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install semver
+
+      - name: Fetch tags
+        run: git fetch --tags
+
+      - name: Get latest tag
+        run: echo "LATEST_TAG=$(git describe --tags `git rev-list --tags --max-count=1`)" >> $GITHUB_ENV
+
+      - name: Increment tag
+        run: |
+          import semver
+          latest_tag = "${{ env.LATEST_TAG }}"
+          # Strip the leading 'v' if present
+          latest_tag_stripped = latest_tag.lstrip('v')
+          next_version = semver.bump_patch(latest_tag_stripped)
+          next_tag = 'v' + next_version
+          print(f"NEXT_TAG={next_tag}" + " >> $GITHUB_ENV")
+        shell: python
+
+      - name: Create Release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ env.NEXT_TAG }}
+          release_name: Release ${{ env.NEXT_TAG }}
+          draft: false
+          prerelease: false
