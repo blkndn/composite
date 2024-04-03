@@ -34,12 +34,13 @@ jobs:
       - name: Increment tag
         run: |
           import semver
+          from os import environ
           latest_tag = "${{ env.LATEST_TAG }}"
           # Strip the leading 'v' if present
           latest_tag_stripped = latest_tag.lstrip('v')
           next_version = semver.bump_patch(latest_tag_stripped)
           next_tag = 'v' + next_version
-          print(f"NEXT_TAG={next_tag}" + " >> $GITHUB_ENV")
+          print(f"echo NEXT_TAG={next_tag} >> $GITHUB_ENV")
         shell: python
 
       - name: Create Release
