@@ -14,7 +14,6 @@ runs:
   using: "composite"
   steps:
     - run: |
-        echo "Current version: ${{ inputs.current_version }}"
         package_versions=$(curl -sH "Authorization: token ${{ inputs.github_token }}" "${{ inputs.package_url }}/versions")
 
         if [[ $? -eq 0 ]] && echo "$package_versions" | jq -e '.[] | select(.name != null)' > /dev/null; then
@@ -33,6 +32,8 @@ runs:
           new_version="${lv[0]}.${lv[1]}.$((lv[2]+1))"
         fi
         
+        echo "Current version: ${{ inputs.current_version }}" 
+        echo "Current package version: $latest_version"
         echo "New version to be used: $new_version"
         echo "NEW_VERSION=$new_version" >> $GITHUB_ENV
       shell: bash
