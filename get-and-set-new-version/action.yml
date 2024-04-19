@@ -15,7 +15,6 @@ runs:
   steps:
     - run: |
         package_versions=$(curl -sH "Authorization: token ${{ inputs.github_token }}" "${{ inputs.package_url }}/versions")
-        echo "Package versions output: $package_versions"
   
         if [[ $? -eq 0 ]] && echo "$package_versions" | jq -e '.[] | select(.name != null)' > /dev/null; then
           latest_version=$(echo "$package_versions" | jq -r '[.[] | select(.name != null)] | .[0].name')
