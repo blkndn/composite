@@ -33,7 +33,6 @@ runs:
           new_version="${lv[0]}.${lv[1]}.$((lv[2]+1))"
         fi
         
-        echo "Current version: ${{ inputs.current_version }}" 
         echo "Current package version: $latest_version"
         echo "New version to be used: $new_version"
         echo "NEW_VERSION=$new_version" >> $GITHUB_ENV
