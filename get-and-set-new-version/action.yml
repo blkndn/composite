@@ -18,9 +18,7 @@ runs:
         
         if [[ $? -eq 0 ]] && echo "$package_versions" | jq -e '.[] | select(.name != null)' > /dev/null; then
           latest_version=$(echo "$package_versions" | jq -r '[.[] | select(.name != null)] | .[0].name')
-          echo "Latest version found: $latest_version"
         else
-          echo "Package not found or no valid versions available. Setting version to default."
           latest_version="0.0.0"
         fi
         
