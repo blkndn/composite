@@ -20,7 +20,7 @@ jobs:
       - test
     steps:
       - name: Check out code
-        uses: actions/checkout@v4.1.2
+        uses: actions/checkout@v5
 
       - name: Auto-merge
         uses: ahmadnassri/action-dependabot-auto-merge@v2.6.6
