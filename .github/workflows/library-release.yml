@@ -157,9 +157,13 @@ jobs:
                 count=$(git rev-list --count HEAD)
               fi
             fi
-            echo "Nothing to publish: $count commits since $since."
+            commits=commits
+            if [ "$count" = 1 ]; then
+              commits=commit
+            fi
+            echo "Nothing to publish: $count $commits since $since."
             {
-              echo "Nothing to publish: $count commits since $since."
+              echo "Nothing to publish: $count $commits since $since."
               echo
               echo "No change fragment in .changes/unreleased has a releasable kind (Breaking, Added, Deprecated, Fixed, Security or Dependencies)."
             } >> "$GITHUB_STEP_SUMMARY"
@@ -286,11 +290,16 @@ jobs:
           VERSION: ${{ needs.prepare.outputs.version }}
           TOKEN: ${{ github.token }}
         run: |
-          url="https://maven.pkg.github.com/$GITHUB_REPOSITORY/${GROUP//.//}/$ARTIFACT/$VERSION/$ARTIFACT-$VERSION.pom"
-          status=$(curl -s -o /dev/null -w '%{http_code}' --config - "$url" <<< "user = \"$GITHUB_ACTOR:$TOKEN\"" || true)
-          if [ "$status" = 200 ]; then
+          base="https://maven.pkg.github.com/$GITHUB_REPOSITORY/${GROUP//.//}/$ARTIFACT/$VERSION/$ARTIFACT-$VERSION"
+          pom=$(curl -s -o /dev/null -w '%{http_code}' --config - "$base.pom" <<< "user = \"$GITHUB_ACTOR:$TOKEN\"" || true)
+          jar=$(curl -s -o /dev/null -w '%{http_code}' --config - "$base.jar" <<< "user = \"$GITHUB_ACTOR:$TOKEN\"" || true)
+          echo "Registry: POM HTTP $pom, jar HTTP $jar."
+          if [ "$pom" = 200 ] && [ "$jar" = 200 ]; then
             echo "$GROUP:$ARTIFACT:$VERSION is already published."
             echo "published=true" >> "$GITHUB_OUTPUT"
+          elif [ "$pom" = 200 ] || [ "$jar" = 200 ]; then
+            echo "::error::$GROUP:$ARTIFACT:$VERSION is only partly published (POM HTTP $pom, jar HTTP $jar): delete that package version in GitHub Packages, then re-run the failed jobs"
+            exit 1
           else
             echo "published=false" >> "$GITHUB_OUTPUT"
           fi
@@ -308,12 +317,12 @@ jobs:
         with:
           cache-provider: basic
 
-      - name: Build the artifacts
+      - name: Build the artifacts and resolve the publication
         if: steps.registry.outputs.published != 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.packages-read-token || github.token }}
           VERSION: ${{ needs.prepare.outputs.version }}
-        run: ./gradlew assemble "-PreleaseVersion=$VERSION"
+        run: ./gradlew publishToMavenLocal "-PreleaseVersion=$VERSION"
 
       - name: Publish to GitHub Packages
         if: steps.registry.outputs.published != 'true'
