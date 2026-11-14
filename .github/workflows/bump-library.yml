@@ -102,7 +102,26 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           BRANCH: ${{ steps.release.outputs.branch }}
+          SLUG: ${{ steps.release.outputs.slug }}
+          VERSION: ${{ inputs.version }}
         run: |
+          prefix="chore/bump-$SLUG-"
+          open=$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --limit 200 --json number,headRefName,isCrossRepository --jq '.[] | select(.isCrossRepository | not) | "\(.number) \(.headRefName)"')
+          while read -r number head; do
+            [ -n "$number" ] || continue
+            case "$head" in
+              "$prefix"*) ;;
+              *) continue ;;
+            esac
+            other="${head#"$prefix"}"
+            [[ "$other" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || continue
+            [ "$other" != "$VERSION" ] || continue
+            if [ "$(printf '%s\n%s\n' "$other" "$VERSION" | sort -V | tail -n 1)" = "$other" ]; then
+              echo "::notice::Pull request #$number already bumps to $other, newer than $VERSION: nothing to do."
+              echo "next=none" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done <<< "$open"
           states=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$BRANCH" --state all --json state --jq 'map(.state) | join(",")')
           if [ -n "$states" ]; then
             echo "$BRANCH already has a pull request ($states): nothing to bump."
@@ -118,11 +137,39 @@ jobs:
           fi
 
       - name: Check out the base branch
-        if: steps.earlier.outputs.next == 'bump'
+        if: steps.earlier.outputs.next == 'bump' || steps.earlier.outputs.next == 'open'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.base-branch }}
           token: ${{ steps.app-token.outputs.token }}
+          fetch-depth: ${{ steps.earlier.outputs.next == 'open' && '0' || '1' }}
+
+      - name: Recompute the previous version from the existing branch
+        id: reopen
+        if: steps.earlier.outputs.next == 'open'
+        env:
+          COORDINATE: ${{ steps.release.outputs.coordinate }}
+          BRANCH: ${{ steps.release.outputs.branch }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          escaped="${COORDINATE//./\\.}"
+          pattern="['\"]${escaped}:[0-9][0-9A-Za-z.+-]*['\"]"
+          git fetch -q --no-tags origin "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"
+          fork=$(git merge-base HEAD "origin/$BRANCH" || true)
+          previous=''
+          if [ -n "$fork" ]; then
+            previous=$({ git grep -hoE "$pattern" "$fork" -- '*.gradle' '*.gradle.kts' || true; } | sed -E "s/^['\"][^:]+:[^:]+:([^'\"]+)['\"]$/\1/" | sort -uV | tail -n 1)
+          fi
+          if ! [[ "$previous" =~ ^[0-9][0-9A-Za-z.+-]*$ ]]; then
+            echo "::warning::Could not recompute the previous version of $COORDINATE from $BRANCH"
+            exit 0
+          fi
+          major=false
+          [ "${previous%%.*}" = "${VERSION%%.*}" ] || major=true
+          {
+            echo "previous=$previous"
+            echo "major=$major"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Replace the version
         id: replace
@@ -201,15 +248,18 @@ jobs:
           BASE: ${{ inputs.base-branch }}
           COORDINATE: ${{ steps.release.outputs.coordinate }}
           VERSION: ${{ inputs.version }}
-          PREVIOUS: ${{ steps.replace.outputs.previous }}
-          MAJOR: ${{ steps.replace.outputs.major }}
+          PREVIOUS: ${{ steps.replace.outputs.previous || steps.reopen.outputs.previous }}
+          MAJOR: ${{ steps.replace.outputs.major || steps.reopen.outputs.major }}
           LIBRARY: ${{ inputs.library }}
           SOURCE: ${{ inputs.source-repository }}
           OWNER: ${{ github.repository_owner }}
         run: |
+          breaking=" If \`$COORDINATE\` is part of this repository's API, change the kind of the change fragment from Dependencies to Breaking."
           body="Automatic upgrade of \`$COORDINATE\` to $VERSION after its release."
           if [ -n "$PREVIOUS" ]; then
             body+=$'\n\n'"Previous version: $PREVIOUS."
+          else
+            body+=$'\n\n'"Previous version: unknown (the branch already existed and it could not be recomputed)."
           fi
           if [ -n "$SOURCE" ]; then
             body+=$'\n\n'"Release notes: https://github.com/$OWNER/$SOURCE/releases/tag/v$VERSION"
@@ -217,7 +267,12 @@ jobs:
           if [ "$MAJOR" = true ]; then
             body+=$'\n\n'"Major upgrade: adapt the code on this branch."
             if [ "$LIBRARY" = true ]; then
-              body+=" If \`$COORDINATE\` is part of this repository's API, change the kind of the change fragment from Dependencies to Breaking."
+              body+="$breaking"
+            fi
+          elif [ "$MAJOR" != false ]; then
+            body+=$'\n\n'"Unknown whether this is a major upgrade: compare the branch with $BASE. If it is, adapt the code on this branch."
+            if [ "$LIBRARY" = true ]; then
+              body+="$breaking"
             fi
           fi
           url=$(gh pr create --repo "$GITHUB_REPOSITORY" --base "$BASE" --head "$BRANCH" --title "Bump $COORDINATE to $VERSION" --body "$body")
