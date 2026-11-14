@@ -27,7 +27,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           semver='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
-          latest=$(gh api --paginate "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/v" --jq '.[].ref' | sed 's|^refs/tags/||' | grep -E "$semver" | sort -V | tail -n 1 || true)
+          refs=$(gh api --paginate "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/v" --jq '.[].ref') || { echo "::error::Could not list the tags of $GITHUB_REPOSITORY"; exit 1; }
+          latest=$(printf '%s\n' "$refs" | sed 's|^refs/tags/||' | { grep -E "$semver" || true; } | sort -V | tail -n 1)
           if [[ "$latest" =~ $semver ]]; then
             echo "Current version: $latest"
             tag="v${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.$((BASH_REMATCH[3] + 1))"
