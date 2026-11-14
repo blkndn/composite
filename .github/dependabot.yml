@@ -3,6 +3,7 @@ updates:
   - package-ecosystem: github-actions
     open-pull-requests-limit: 10
     directory: /
+    target-branch: integration
     commit-message:
       prefix: chore
       prefix-development: chore

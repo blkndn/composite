@@ -1,0 +1,250 @@
+name: Bump library
+
+on:
+  workflow_call:
+    inputs:
+      group:
+        description: Maven group id of the released library, from the dispatch payload.
+        required: true
+        type: string
+      artifact:
+        description: Maven artifact id of the released library, from the dispatch payload.
+        required: true
+        type: string
+      version:
+        description: Released version without the v prefix, from the dispatch payload.
+        required: true
+        type: string
+      source-repository:
+        description: Repository of the same owner that released the library, from the dispatch payload.
+        required: false
+        type: string
+        default: ''
+      accepted:
+        description: Newline-separated group:artifact coordinates this repository upgrades.
+        required: true
+        type: string
+      library:
+        description: Whether this repository is a library and needs a Dependencies change fragment.
+        required: false
+        type: boolean
+        default: false
+      base-branch:
+        description: Branch the bump starts from and the pull request targets.
+        required: false
+        type: string
+        default: integration
+      app-client-id:
+        description: Client ID of the release GitHub App.
+        required: true
+        type: string
+    secrets:
+      app-private-key:
+        description: Private key of the release GitHub App.
+        required: true
+
+permissions: {}
+
+concurrency:
+  group: bump-library-${{ inputs.group }}-${{ inputs.artifact }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions: {}
+    steps:
+      - name: Check the release
+        id: release
+        env:
+          GROUP: ${{ inputs.group }}
+          ARTIFACT: ${{ inputs.artifact }}
+          VERSION: ${{ inputs.version }}
+          SOURCE: ${{ inputs.source-repository }}
+          ACCEPTED: ${{ inputs.accepted }}
+          BASE: ${{ inputs.base-branch }}
+        run: |
+          [[ "$GROUP" =~ ^es\.bulkynaden(\.[a-z][a-z0-9]*)*$ ]] || { echo "::error::Rejected: the group is not a Bulkynaden group"; exit 1; }
+          [[ "$ARTIFACT" =~ ^[a-z][a-z0-9-]*$ ]] || { echo "::error::Rejected: the artifact is not a Maven artifact id"; exit 1; }
+          [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || { echo "::error::Rejected: the version is not X.Y.Z"; exit 1; }
+          [[ -z "$SOURCE" || "$SOURCE" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "::error::Rejected: the source repository is not a repository name"; exit 1; }
+          [[ "$BASE" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "::error::base-branch is not a branch name"; exit 1; }
+          coordinate="$GROUP:$ARTIFACT"
+          if ! printf '%s\n' "$ACCEPTED" | tr -d '[:blank:]\r' | grep -Fxq -- "$coordinate"; then
+            echo "::error::Rejected: $coordinate is not a dependency this repository upgrades"
+            exit 1
+          fi
+          suffix="${GROUP#es.bulkynaden}"
+          suffix="${suffix#.}"
+          slug="${suffix//./-}${suffix:+-}$ARTIFACT"
+          {
+            echo "coordinate=$coordinate"
+            echo "slug=$slug"
+            echo "branch=chore/bump-$slug-$VERSION"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create the App token
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ inputs.app-client-id }}
+          private-key: ${{ secrets.app-private-key }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Look for an earlier bump
+        id: earlier
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          BRANCH: ${{ steps.release.outputs.branch }}
+        run: |
+          states=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$BRANCH" --state all --json state --jq 'map(.state) | join(",")')
+          if [ -n "$states" ]; then
+            echo "$BRANCH already has a pull request ($states): nothing to bump."
+            {
+              echo "next=none"
+              echo "url=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$BRANCH" --state open --json url --jq '.[0].url // ""')"
+            } >> "$GITHUB_OUTPUT"
+          elif gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$BRANCH" --silent 2> /dev/null; then
+            echo "$BRANCH exists without a pull request: opening it."
+            echo "next=open" >> "$GITHUB_OUTPUT"
+          else
+            echo "next=bump" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check out the base branch
+        if: steps.earlier.outputs.next == 'bump'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.base-branch }}
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Replace the version
+        id: replace
+        if: steps.earlier.outputs.next == 'bump'
+        env:
+          COORDINATE: ${{ steps.release.outputs.coordinate }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          escaped="${COORDINATE//./\\.}"
+          pattern="['\"]${escaped}:[0-9][0-9A-Za-z.+-]*['\"]"
+          files=$(git grep -lE "$pattern" -- '*.gradle' '*.gradle.kts' || true)
+          if [ -z "$files" ]; then
+            echo "::error::No literal declaration of $COORDINATE in the Gradle build files"
+            exit 1
+          fi
+          current=$(git grep -hoE "$pattern" -- '*.gradle' '*.gradle.kts' | sed -E "s/^['\"][^:]+:[^:]+:([^'\"]+)['\"]$/\1/" | sort -uV | tail -n 1)
+          highest=$(printf '%s\n%s\n' "$current" "$VERSION" | sort -V | tail -n 1)
+          if [ "$current" != "$VERSION" ] && [ "$highest" = "$current" ]; then
+            echo "::warning::$COORDINATE is already at $current, newer than $VERSION: nothing to do."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          while IFS= read -r file; do
+            sed -E -i "s/(['\"])${escaped}:[0-9][0-9A-Za-z.+-]*(['\"])/\1${COORDINATE}:${VERSION}\2/g" "$file"
+          done <<< "$files"
+          if git diff --quiet; then
+            echo "$COORDINATE is already at $VERSION: nothing to do."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          major=false
+          [ "${current%%.*}" = "${VERSION%%.*}" ] || major=true
+          {
+            echo "changed=true"
+            echo "previous=$current"
+            echo "major=$major"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Add the change fragment
+        if: steps.replace.outputs.changed == 'true' && inputs.library
+        env:
+          COORDINATE: ${{ steps.release.outputs.coordinate }}
+          VERSION: ${{ inputs.version }}
+          PREVIOUS: ${{ steps.replace.outputs.previous }}
+        run: |
+          [ -f .changie.yaml ] || { echo "::error::library is true but .changie.yaml is missing"; exit 1; }
+          mkdir -p .changes/unreleased
+          printf 'kind: Dependencies\nbody: "Upgrade %s from %s to %s."\ntime: %s\n' "$COORDINATE" "$PREVIOUS" "$VERSION" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > ".changes/unreleased/Dependencies-$(date -u +%Y%m%d-%H%M%S).yaml"
+
+      - name: Commit and push the bump
+        if: steps.replace.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          BRANCH: ${{ steps.release.outputs.branch }}
+          COORDINATE: ${{ steps.release.outputs.coordinate }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          user_id=$(gh api "/users/${APP_SLUG}[bot]" --jq .id)
+          git config user.name "${APP_SLUG}[bot]"
+          git config user.email "${user_id}+${APP_SLUG}[bot]@users.noreply.github.com"
+          git switch -c "$BRANCH"
+          git add -u
+          if [ -d .changes/unreleased ]; then
+            git add .changes/unreleased
+          fi
+          git commit -m "Bump $COORDINATE to $VERSION"
+          git push origin "HEAD:refs/heads/$BRANCH"
+
+      - name: Open the pull request
+        id: open
+        if: steps.replace.outputs.changed == 'true' || steps.earlier.outputs.next == 'open'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          BRANCH: ${{ steps.release.outputs.branch }}
+          BASE: ${{ inputs.base-branch }}
+          COORDINATE: ${{ steps.release.outputs.coordinate }}
+          VERSION: ${{ inputs.version }}
+          PREVIOUS: ${{ steps.replace.outputs.previous }}
+          MAJOR: ${{ steps.replace.outputs.major }}
+          LIBRARY: ${{ inputs.library }}
+          SOURCE: ${{ inputs.source-repository }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          body="Automatic upgrade of \`$COORDINATE\` to $VERSION after its release."
+          if [ -n "$PREVIOUS" ]; then
+            body+=$'\n\n'"Previous version: $PREVIOUS."
+          fi
+          if [ -n "$SOURCE" ]; then
+            body+=$'\n\n'"Release notes: https://github.com/$OWNER/$SOURCE/releases/tag/v$VERSION"
+          fi
+          if [ "$MAJOR" = true ]; then
+            body+=$'\n\n'"Major upgrade: adapt the code on this branch."
+            if [ "$LIBRARY" = true ]; then
+              body+=" If \`$COORDINATE\` is part of this repository's API, change the kind of the change fragment from Dependencies to Breaking."
+            fi
+          fi
+          url=$(gh pr create --repo "$GITHUB_REPOSITORY" --base "$BASE" --head "$BRANCH" --title "Bump $COORDINATE to $VERSION" --body "$body")
+          echo "Opened $url."
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+
+      - name: Close the earlier bumps of the library
+        if: steps.open.outputs.url != '' || steps.earlier.outputs.url != ''
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          URL: ${{ steps.open.outputs.url || steps.earlier.outputs.url }}
+          SLUG: ${{ steps.release.outputs.slug }}
+          COORDINATE: ${{ steps.release.outputs.coordinate }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          prefix="chore/bump-$SLUG-"
+          open=$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --limit 200 --json number,headRefName,isCrossRepository --jq '.[] | select(.isCrossRepository | not) | "\(.number) \(.headRefName)"')
+          while read -r number head; do
+            [ -n "$number" ] || continue
+            case "$head" in
+              "$prefix"*) ;;
+              *) continue ;;
+            esac
+            older="${head#"$prefix"}"
+            [[ "$older" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || continue
+            [ "$older" != "$VERSION" ] || continue
+            [ "$(printf '%s\n%s\n' "$older" "$VERSION" | sort -V | tail -n 1)" = "$VERSION" ] || continue
+            gh pr close "$number" --repo "$GITHUB_REPOSITORY" --comment "Superseded by $URL, which upgrades $COORDINATE to $VERSION."
+            echo "Closed #$number ($head), superseded by $URL."
+          done <<< "$open"

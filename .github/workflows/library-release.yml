@@ -1,0 +1,432 @@
+name: Library release
+
+on:
+  workflow_call:
+    inputs:
+      group:
+        description: Maven group id of the library, such as es.bulkynaden.spring.
+        required: true
+        type: string
+      artifact:
+        description: Maven artifact id of the library, such as common.
+        required: true
+        type: string
+      consumers:
+        description: Comma- or newline-separated repositories of the same owner that receive a library-released dispatch.
+        required: false
+        type: string
+        default: ''
+      sync-branches:
+        description: Space-separated branches that receive the release commit.
+        required: false
+        type: string
+        default: dev integration
+      resume-tag:
+        description: Existing release tag to complete instead of batching new fragments, such as v1.2.3.
+        required: false
+        type: string
+        default: ''
+      dry-run:
+        description: Compute the version and the notes and show them in the run summary, without building, pushing, tagging, publishing or notifying.
+        required: false
+        type: boolean
+        default: false
+      java-version:
+        description: JDK version of the build.
+        required: false
+        type: string
+        default: '25'
+      java-distribution:
+        description: JDK distribution of the build.
+        required: false
+        type: string
+        default: corretto
+      changie-version:
+        description: changie release to install, with the v prefix.
+        required: false
+        type: string
+        default: v1.26.0
+      app-client-id:
+        description: Client ID of the release GitHub App; required when consumers is set.
+        required: false
+        type: string
+        default: ''
+    secrets:
+      packages-read-token:
+        description: Token that reads the other Bulkynaden packages while building; GITHUB_TOKEN when absent.
+        required: false
+      app-private-key:
+        description: Private key of the release GitHub App; required when consumers is set.
+        required: false
+    outputs:
+      version:
+        description: The released version, empty when nothing was released.
+        value: ${{ jobs.prepare.outputs.released == 'true' && jobs.prepare.outputs.version || '' }}
+
+permissions: {}
+
+concurrency:
+  group: library-release-${{ github.repository }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      packages: read
+    outputs:
+      released: ${{ steps.decide.outputs.released }}
+      version: ${{ steps.decide.outputs.version }}
+      tag: ${{ steps.decide.outputs.tag }}
+      sha: ${{ steps.push.outputs.sha || steps.decide.outputs.sha }}
+    steps:
+      - name: Check the inputs
+        env:
+          GROUP: ${{ inputs.group }}
+          ARTIFACT: ${{ inputs.artifact }}
+          RESUME_TAG: ${{ inputs.resume-tag }}
+          DRY_RUN: ${{ inputs.dry-run }}
+        run: |
+          [[ "$GROUP" =~ ^es\.bulkynaden(\.[a-z][a-z0-9]*)*$ ]] || { echo "::error::group must be es.bulkynaden or one of its subgroups"; exit 1; }
+          [[ "$ARTIFACT" =~ ^[a-z][a-z0-9-]*$ ]] || { echo "::error::artifact must be a lower-case Maven artifact id"; exit 1; }
+          if [ "$DRY_RUN" = true ] && [ -n "$RESUME_TAG" ]; then
+            echo "::error::dry-run and resume-tag cannot be used together"
+            exit 1
+          fi
+
+      - name: Check out main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Install changie
+        uses: miniscruff/changie-action@3223cb29b92a0972dedc864ace3da01e04780ae4 # v3.0.1
+        with:
+          version: ${{ inputs.changie-version }}
+
+      - name: Decide the release
+        id: decide
+        env:
+          RESUME_TAG: ${{ inputs.resume-tag }}
+          DRY_RUN: ${{ inputs.dry-run }}
+        run: |
+          semver='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          if [ -n "$RESUME_TAG" ]; then
+            [[ "$RESUME_TAG" =~ $semver ]] || { echo "::error::resume-tag must look like v1.2.3"; exit 1; }
+            git rev-parse -q --verify "refs/tags/$RESUME_TAG" > /dev/null || { echo "::error::Tag $RESUME_TAG does not exist"; exit 1; }
+            git merge-base --is-ancestor "$RESUME_TAG" HEAD || { echo "::error::Tag $RESUME_TAG is not on main"; exit 1; }
+            subject=$(git log -1 --format=%s "$RESUME_TAG^{commit}")
+            [ "$subject" = "Release $RESUME_TAG" ] || { echo "::error::Tag $RESUME_TAG does not point to a commit named Release $RESUME_TAG"; exit 1; }
+            {
+              echo "released=true"
+              echo "mode=resume"
+              echo "tag=$RESUME_TAG"
+              echo "version=${RESUME_TAG#v}"
+              echo "sha=$(git rev-parse "$RESUME_TAG^{commit}")"
+            } >> "$GITHUB_OUTPUT"
+            echo "Completing the release $RESUME_TAG: publish, GitHub Release, branch sync and consumer dispatch." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          latest=$(changie latest) || { echo "::error::changie could not read the released versions in .changes"; exit 1; }
+          if ! [[ "$latest" =~ $semver ]] || [ ! -f ".changes/$latest.md" ]; then
+            echo "::error::.changes has no released version; seed .changes/v<latest published>.md"
+            exit 1
+          fi
+          shopt -s nullglob
+          fragments=(.changes/unreleased/*.yaml)
+          if [ "${#fragments[@]}" -gt 0 ]; then
+            changie batch v0.0.0 --dry-run > /dev/null || { echo "::error::A change fragment in .changes/unreleased is invalid, for example its kind is unknown"; exit 1; }
+          fi
+          if [ "${#fragments[@]}" -eq 0 ] || ! grep -qE "^kind: *['\"]?(Breaking|Added|Deprecated|Fixed|Security|Dependencies)['\"]? *$" "${fragments[@]}"; then
+            if git rev-parse -q --verify "refs/tags/$latest" > /dev/null; then
+              since="$latest"
+              count=$(git rev-list --count "$latest..HEAD")
+            else
+              seed=$(git log -n 1 --format=%H --diff-filter=A -- ".changes/$latest.md")
+              since="the seed $latest (no release tag yet)"
+              if [ -n "$seed" ]; then
+                count=$(git rev-list --count "$seed..HEAD")
+              else
+                count=$(git rev-list --count HEAD)
+              fi
+            fi
+            echo "Nothing to publish: $count commits since $since."
+            {
+              echo "Nothing to publish: $count commits since $since."
+              echo
+              echo "No change fragment in .changes/unreleased has a releasable kind (Breaking, Added, Deprecated, Fixed, Security or Dependencies)."
+            } >> "$GITHUB_STEP_SUMMARY"
+            {
+              echo "released=false"
+              echo "mode=none"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          tag=$(changie next auto)
+          [[ "$tag" =~ $semver ]] || { echo "::error::changie returned an unexpected version"; exit 1; }
+          if git rev-parse -q --verify "refs/tags/$tag" > /dev/null; then
+            echo "::error::Tag $tag already exists: complete it with resume-tag or fix the seed"
+            exit 1
+          fi
+          if [ "$DRY_RUN" = true ]; then
+            notes=$(changie batch "$tag" --dry-run)
+            {
+              echo "Dry run: the next release would be $tag. Nothing was built, pushed, tagged, published or sent."
+              echo
+              echo "$notes"
+            } >> "$GITHUB_STEP_SUMMARY"
+            {
+              echo "released=false"
+              echo "mode=dry-run"
+              echo "tag=$tag"
+              echo "version=${tag#v}"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          {
+            echo "released=true"
+            echo "mode=release"
+            echo "tag=$tag"
+            echo "version=${tag#v}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Batch the change fragments
+        if: steps.decide.outputs.mode == 'release'
+        env:
+          TAG: ${{ steps.decide.outputs.tag }}
+        run: |
+          changie batch "$TAG"
+          changie merge
+
+      - name: Check that the version is not published yet
+        if: steps.decide.outputs.mode == 'release' || steps.decide.outputs.mode == 'dry-run'
+        env:
+          GROUP: ${{ inputs.group }}
+          ARTIFACT: ${{ inputs.artifact }}
+          VERSION: ${{ steps.decide.outputs.version }}
+          TOKEN: ${{ github.token }}
+        run: |
+          url="https://maven.pkg.github.com/$GITHUB_REPOSITORY/${GROUP//.//}/$ARTIFACT/$VERSION/$ARTIFACT-$VERSION.pom"
+          status=$(curl -s -o /dev/null -w '%{http_code}' --config - "$url" <<< "user = \"$GITHUB_ACTOR:$TOKEN\"" || true)
+          if [ "$status" = 200 ]; then
+            echo "::error::$GROUP:$ARTIFACT:$VERSION is already published: the seed in .changes is behind the registry"
+            exit 1
+          fi
+          if [ "$status" != 404 ]; then
+            echo "::warning::The registry answered HTTP $status for $GROUP:$ARTIFACT:$VERSION; continuing"
+          fi
+          echo "The registry does not hold $GROUP:$ARTIFACT:$VERSION yet (HTTP $status)." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Set up the JDK
+        if: steps.decide.outputs.mode == 'release'
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+        with:
+          java-version: ${{ inputs.java-version }}
+          distribution: ${{ inputs.java-distribution }}
+
+      - name: Set up Gradle
+        if: steps.decide.outputs.mode == 'release'
+        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+        with:
+          cache-provider: basic
+
+      - name: Build and test the release
+        if: steps.decide.outputs.mode == 'release'
+        env:
+          GITHUB_TOKEN: ${{ secrets.packages-read-token || github.token }}
+          VERSION: ${{ steps.decide.outputs.version }}
+        run: ./gradlew build "-PreleaseVersion=$VERSION"
+
+      - name: Commit, tag and push the release
+        id: push
+        if: steps.decide.outputs.mode == 'release'
+        env:
+          TAG: ${{ steps.decide.outputs.tag }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A -- .changes CHANGELOG.md
+          git commit -m "Release $TAG"
+          git tag -a "$TAG" -m "Release $TAG"
+          git push --atomic origin HEAD:refs/heads/main "refs/tags/$TAG"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          {
+            echo "Released $TAG."
+            echo
+            cat ".changes/$TAG.md"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    needs: prepare
+    if: needs.prepare.outputs.released == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out the release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+          persist-credentials: false
+
+      - name: Look for the version in the registry
+        id: registry
+        env:
+          GROUP: ${{ inputs.group }}
+          ARTIFACT: ${{ inputs.artifact }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          TOKEN: ${{ github.token }}
+        run: |
+          url="https://maven.pkg.github.com/$GITHUB_REPOSITORY/${GROUP//.//}/$ARTIFACT/$VERSION/$ARTIFACT-$VERSION.pom"
+          status=$(curl -s -o /dev/null -w '%{http_code}' --config - "$url" <<< "user = \"$GITHUB_ACTOR:$TOKEN\"" || true)
+          if [ "$status" = 200 ]; then
+            echo "$GROUP:$ARTIFACT:$VERSION is already published."
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up the JDK
+        if: steps.registry.outputs.published != 'true'
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+        with:
+          java-version: ${{ inputs.java-version }}
+          distribution: ${{ inputs.java-distribution }}
+
+      - name: Set up Gradle
+        if: steps.registry.outputs.published != 'true'
+        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+        with:
+          cache-provider: basic
+
+      - name: Build the artifacts
+        if: steps.registry.outputs.published != 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.packages-read-token || github.token }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: ./gradlew assemble "-PreleaseVersion=$VERSION"
+
+      - name: Publish to GitHub Packages
+        if: steps.registry.outputs.published != 'true'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: ./gradlew publish "-PreleaseVersion=$VERSION"
+
+  github-release:
+    needs: [prepare, publish]
+    if: needs.prepare.outputs.released == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+          persist-credentials: false
+
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "The GitHub Release $TAG already exists."
+            exit 0
+          fi
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --title "$TAG" --notes-file ".changes/$TAG.md"
+
+  sync-branches:
+    needs: prepare
+    if: needs.prepare.outputs.released == 'true' && inputs.sync-branches != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Merge the release into the working branches
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.prepare.outputs.sha }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          BRANCHES: ${{ inputs.sync-branches }}
+        run: |
+          for branch in $BRANCHES; do
+            [[ "$branch" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "::error::sync-branches holds an invalid branch name"; exit 1; }
+          done
+          failed=''
+          for branch in $BRANCHES; do
+            if gh api -X POST "repos/$GITHUB_REPOSITORY/merges" -f base="$branch" -f head="$SHA" -f commit_message="Merge release $TAG into $branch" --silent; then
+              echo "$branch contains $TAG."
+            else
+              echo "::error::Could not merge $TAG into $branch: merge origin/main into a task branch from $branch"
+              failed="$failed $branch"
+            fi
+          done
+          [ -z "$failed" ]
+
+  notify-consumers:
+    needs: [prepare, publish]
+    if: needs.prepare.outputs.released == 'true' && inputs.consumers != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Check the consumers
+        id: consumers
+        env:
+          CONSUMERS: ${{ inputs.consumers }}
+          CLIENT_ID: ${{ inputs.app-client-id }}
+        run: |
+          [ -n "$CLIENT_ID" ] || { echo "::error::app-client-id is required when consumers is set"; exit 1; }
+          list=$(printf '%s\n' "$CONSUMERS" | tr ',' '\n' | tr -d '[:blank:]\r' | sed '/^$/d')
+          [ -n "$list" ] || { echo "::error::consumers holds no repository name"; exit 1; }
+          while IFS= read -r repo; do
+            [[ "$repo" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "::error::consumers holds an invalid repository name"; exit 1; }
+          done <<< "$list"
+          {
+            echo "list<<CONSUMERS_END"
+            echo "$list"
+            echo "CONSUMERS_END"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create the App token
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ inputs.app-client-id }}
+          private-key: ${{ secrets.app-private-key }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ steps.consumers.outputs.list }}
+          permission-contents: write
+
+      - name: Send library-released to each consumer
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          LIST: ${{ steps.consumers.outputs.list }}
+          OWNER: ${{ github.repository_owner }}
+          GROUP: ${{ inputs.group }}
+          ARTIFACT: ${{ inputs.artifact }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          failed=''
+          while IFS= read -r repo; do
+            if gh api -X POST "repos/$OWNER/$repo/dispatches" -f event_type=library-released -f "client_payload[group]=$GROUP" -f "client_payload[artifact]=$ARTIFACT" -f "client_payload[version]=$VERSION" -f "client_payload[repository]=${GITHUB_REPOSITORY#*/}" --silent; then
+              echo "Sent library-released to $OWNER/$repo."
+            else
+              echo "::error::Could not send library-released to $OWNER/$repo"
+              failed="$failed $repo"
+            fi
+          done <<< "$LIST"
+          [ -z "$failed" ]
