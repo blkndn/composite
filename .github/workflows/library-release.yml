@@ -292,13 +292,13 @@ jobs:
         run: |
           base="https://maven.pkg.github.com/$GITHUB_REPOSITORY/${GROUP//.//}/$ARTIFACT/$VERSION/$ARTIFACT-$VERSION"
           pom=$(curl -s -o /dev/null -w '%{http_code}' --config - "$base.pom" <<< "user = \"$GITHUB_ACTOR:$TOKEN\"" || true)
-          jar=$(curl -s -o /dev/null -w '%{http_code}' --config - "$base.jar" <<< "user = \"$GITHUB_ACTOR:$TOKEN\"" || true)
-          echo "Registry: POM HTTP $pom, jar HTTP $jar."
-          if [ "$pom" = 200 ] && [ "$jar" = 200 ]; then
+          module=$(curl -s -o /dev/null -w '%{http_code}' --config - "$base.module" <<< "user = \"$GITHUB_ACTOR:$TOKEN\"" || true)
+          echo "Registry: POM HTTP $pom, module metadata HTTP $module."
+          if [ "$pom" = 200 ] && [ "$module" = 200 ]; then
             echo "$GROUP:$ARTIFACT:$VERSION is already published."
             echo "published=true" >> "$GITHUB_OUTPUT"
-          elif [ "$pom" = 200 ] || [ "$jar" = 200 ]; then
-            echo "::error::$GROUP:$ARTIFACT:$VERSION is only partly published (POM HTTP $pom, jar HTTP $jar): delete that package version in GitHub Packages, then re-run the failed jobs"
+          elif [ "$pom" = 200 ] || [ "$module" = 200 ]; then
+            echo "::error::$GROUP:$ARTIFACT:$VERSION is only partly published (POM HTTP $pom, module metadata HTTP $module): delete that package version in GitHub Packages, then re-run the failed jobs"
             exit 1
           else
             echo "published=false" >> "$GITHUB_OUTPUT"
