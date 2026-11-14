@@ -2,21 +2,41 @@ name: Merge to main
 
 on:
   push:
-    branches: [ dev ]
+    branches:
+      - dev
 
-permissions:
-  contents: write
+permissions: {}
+
+concurrency:
+  group: merge-to-main
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
-  merge-to-main:
-    if: github.ref == 'refs/heads/dev' && github.event_name == 'push'
+  lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4.1.2
-
-      - name: Merge dev -> main
-        uses: devmasx/merge-branch@1.4.0
+      - name: Check out the code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          type: now
-          target_branch: main
-          github_token: ${{ secrets.MY_GITHUB_PAT }}
+          persist-credentials: false
+
+      - name: Lint the workflows
+        run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 -color
+
+  merge-to-main:
+    needs: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Merge dev into main
+        env:
+          GH_TOKEN: ${{ secrets.MY_GITHUB_PAT }}
+        run: gh api -X POST "repos/$GITHUB_REPOSITORY/merges" -f base=main -f head="$GITHUB_SHA" -f commit_message="Merge dev into main" --silent
