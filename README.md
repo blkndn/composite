@@ -26,12 +26,12 @@ Releases a library from its change fragments (ADR-0017). It runs on every push t
    - no fragment in `.changes/unreleased` with a releasable kind (`Breaking`, `Added`, `Deprecated`, `Fixed`, `Security`, `Dependencies`): nothing is published, and the run summary says `Nothing to publish: N commits since vX.Y.Z` (or `since the seed vX.Y.Z (no release tag yet)` before the first tagged release). `Internal` fragments alone never release, but they stay in the notes of the next release;
    - a fragment with an unknown kind, or a library without a seed version in `.changes`, fails the run;
    - otherwise `changie next auto` gives the version. The job batches the fragments (`changie batch`, `changie merge`), fails if the registry already holds that version (a wrong seed), builds and tests with `-PreleaseVersion=X.Y.Z`, commits `Release vX.Y.Z` (`CHANGELOG.md` and `.changes/`), tags `vX.Y.Z` and pushes both atomically. A failed build pushes nothing. The run summary states the version and the notes.
-2. **`publish`** builds the tag and runs `./gradlew publish -PreleaseVersion=X.Y.Z`, unless the registry already holds that version.
+2. **`publish`** checks out the tag, then checks the registry for the version's POM (`<artifact>-<version>.pom`) and Gradle module metadata (`<artifact>-<version>.module`), the two files every library publishes whatever its jar is called (spring-common and spring-events publish `<artifact>-<version>-plain.jar`). With both present it does nothing; with only one it fails and asks to delete the half-uploaded version (see recovery). Otherwise it runs `./gradlew publishToMavenLocal` with the read token, so that every dependency resolution of the publication (the jars, the POM's `versionMapping` and the module metadata) happens with a token that can read the other packages, whatever the publication is called. Then it runs `./gradlew publish -PreleaseVersion=X.Y.Z` with `GITHUB_TOKEN`.
 3. **`github-release`** creates the GitHub Release with the batch's notes, unless it exists.
 4. **`sync-branches`** merges the release commit into `dev` and `integration` through the merges API.
 5. **`notify-consumers`** sends `repository_dispatch` (`library-released`) to each consumer with the App token. The payload carries `group`, `artifact`, `version` (without `v`) and `repository` (the library's repository name).
 
-Pushes and merges made with `GITHUB_TOKEN` start no workflows, so the release commit does not trigger another release. One release runs at a time per repository (concurrency group `library-release-<owner>/<repo>`, never cancelled); a caller must not declare the same group.
+Pushes and merges made with `GITHUB_TOKEN` start no workflows, so the release commit does not trigger another release. One release runs at a time per repository (concurrency group `library-release-<owner>/<repo>`, never cancelled); a caller must not declare the same group. GitHub keeps only the newest pending run of a group and cancels any older pending one, so start a `resume-tag` or dry run only when no release of that library is running or queued.
 
 ### Inputs
 
@@ -61,9 +61,10 @@ Output: `version`, the released version, empty when nothing was released (also i
 
 ### What the library needs
 
-- `.changie.yaml` with the kinds of ADR-0017 (`Breaking` major; `Added`, `Deprecated` minor; `Fixed`, `Security`, `Dependencies` patch; `Internal` none), `.changes/header.tpl.md` and `.changes/unreleased/.gitkeep`.
+- `.changie.yaml` with the kinds of ADR-0017 (`Breaking` major; `Added`, `Deprecated` minor; `Fixed`, `Security`, `Dependencies` patch; `Internal` none), `.changes/header.tpl.md` and `.changes/unreleased/.gitkeep`. The releasable kinds are also listed in the workflow's "Decide the release" step: a kind added to or removed from a library's `.changie.yaml` must change there too, in the same task.
 - A seed `.changes/v<latest published>.md`, so that changie continues from the published version.
-- `build.gradle` takes its version from `-PreleaseVersion` (`0.0.0-SNAPSHOT` otherwise) and publishes with the `GITHUB_TOKEN` environment variable.
+- changie's layout as the workflows read it: `changesDir: .changes`, `unreleasedDir: unreleased`, fragments ending in `.yaml`, `versionExt: md` (so a release's notes are `.changes/vX.Y.Z.md`) and `changelogPath: CHANGELOG.md`.
+- `build.gradle` takes its version from `-PreleaseVersion` (`0.0.0-SNAPSHOT` otherwise) and publishes with the `GITHUB_TOKEN` environment variable to the GitHub Packages registry of the repository that runs the release (`https://maven.pkg.github.com/<owner>/<this repository>`), with Gradle module metadata enabled (the default; do not disable `GenerateModuleMetadata`), because the registry checks look for `<artifact>-<version>.pom` and `.module` there.
 - The organisation variable `RELEASE_APP_CLIENT_ID` and secret `RELEASE_APP_PRIVATE_KEY`, and the App installed on every consumer with Contents and Pull requests write.
 
 ### Caller
@@ -117,12 +118,19 @@ jobs:
 
 Run the caller by hand (**Actions → Release → Run workflow**) with `dry-run` ticked. The run summary shows the version the next release would get and its batched notes, and whether the registry already holds that version. Nothing is built, committed, tagged, pushed, published, released, merged or sent: every job after `prepare` is skipped. `dry-run` together with `resume-tag` is an error.
 
+A dry run reads `main`, so it shows what is already promoted. To preview what promoting `integration` would release, run on an up-to-date checkout of the library's `integration`:
+
+```sh
+changie next auto
+changie batch "$(changie next auto)" --dry-run
+```
+
 ### Recovery
 
 - **The build or the tests fail in `prepare`:** nothing was pushed. Fix it through the normal flow; the next push to `main` releases.
 - **A job after `prepare` fails** (`publish`, `github-release`, `sync-branches`, `notify-consumers`): use **Re-run failed jobs**. GitHub keeps `prepare`'s outputs, and every later job is idempotent: `publish` skips a version the registry already holds, the GitHub Release is not created twice, a merge with nothing to merge does nothing, and a repeated dispatch finds the bump already open.
 - **The run was re-run with "Re-run all jobs", or the re-run window has passed:** `prepare` finds no fragments and does nothing. Run the caller by hand with `resume-tag: vX.Y.Z`. It checks that the value looks like `vX.Y.Z`, that the tag exists and is on `main`, and that its commit is named `Release vX.Y.Z`, and then runs the same idempotent jobs for that tag.
-- **A half-uploaded package version:** GitHub Packages rejects a second upload of a version (HTTP 409). Delete that version in the package's settings (**Packages → the package → Manage versions**), then re-run the failed jobs or use `resume-tag`.
+- **A half-uploaded package version:** `publish` fails with "only partly published" when the registry holds the POM or the module metadata (`.module`) but not both, because GitHub Packages rejects a second upload of a version (HTTP 409). Delete that version in the package's settings (**Packages → the package → Manage versions**), then re-run the failed jobs or use `resume-tag`.
 - **`sync-branches` reports a conflict:** a released fragment or `CHANGELOG.md` was edited on `dev` or `integration`. Merge `origin/main` into a `chore/sync-release-vX.Y.Z` task branch from that branch and close it like any task.
 - **The seed guard fails** (the registry already holds the computed version): the seed in `.changes` is behind the registry. Correct the seed through the normal flow.
 
@@ -131,7 +139,7 @@ Run the caller by hand (**Actions → Release → Run workflow**) with `dry-run`
 Runs in a library consumer when it receives `library-released`. It:
 
 1. **validates the payload** before using or printing it: `group` must be `es.bulkynaden` or a subgroup, `artifact` a lower-case artifact id, `version` exactly `X.Y.Z`, `repository` a repository name, and `group:artifact` one of the caller's `accepted` coordinates. Anything else fails the run;
-2. stops if a pull request for the bump branch already exists, and opens one if the branch exists without it;
+2. does nothing, with a notice, if an open pull request already bumps the same library to a higher version (a late dispatch or a `resume-tag` of an older release); stops if a pull request for the bump branch already exists; and opens one if the branch exists without it, recomputing the previous version (and so the major-upgrade advice) from the commit the branch started from, or saying in the body that it is unknown;
 3. creates the branch from `base-branch` and replaces every quoted literal `'<group>:<artifact>:<version>'` in the tracked `*.gradle` and `*.gradle.kts` files. The match starts at the opening quote, so `es.bulkynaden:common` never touches `es.bulkynaden.spring:common` and vice versa. No declaration fails the run; a declared version newer than the release (a downgrade) or equal to it ends the run with nothing to do;
 4. in a library (`library: true`), adds a `Dependencies` change fragment;
 5. commits as the App, pushes and opens the pull request into `base-branch`. On a major jump the body asks to adapt the code and, in a library, to change the fragment's kind to `Breaking` if the dependency is part of the repository's API;
@@ -200,9 +208,9 @@ jobs:
 
 Changes follow the workspace flow: task branch → `integration` → `dev` → `main`.
 
-- `merge-to-main.yml`: on a push to `dev`, lints every workflow with actionlint 1.7.12 (its Docker image, pinned by digest, which bundles shellcheck), then merges `dev` into `main` with the personal token, so that the push starts `release.yml`.
+- `merge-to-main.yml`: on a push to `dev`, lints every workflow with actionlint 1.7.12 (its Docker image, pinned by digest, which bundles shellcheck), then merges `dev` into `main` with the personal token, so that the push starts `release.yml`. Dependabot does not see that digest: update it by hand (`docker buildx imagetools inspect rhysd/actionlint:<version>` gives the index digest).
 - `release.yml`: on a push to `main`, creates the next patch release (`gh release create` on the pushed commit, with generated notes) after the highest `vX.Y.Z` tag.
-- `auto-merge.yml`: enables auto-merge on Dependabot's minor and patch updates of the workflows into `integration`.
+- `auto-merge.yml`: enables auto-merge on Dependabot's minor and patch updates of the workflows into `integration`. It needs **Settings → General → Allow auto-merge** enabled in this repository.
 - `dependabot.yml`: daily `github-actions` updates into `integration`.
 
 Every third-party action is pinned to a full commit SHA, followed by its version tag.
