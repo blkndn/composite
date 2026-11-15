@@ -20,13 +20,13 @@ The `uses:` line then reads `blkndn/composite/.github/workflows/library-release.
 
 ## `library-release.yml`
 
-Releases a library from its change fragments (ADR-0017). It runs on every push to the library's `main`:
+Releases a library from its change fragments (ADR-0017), or, with `artifacts`, the modules of a multi-module repository together with one version (see "Several artifacts"). It runs on every push to the library's `main`:
 
 1. **`prepare`** checks out the tip of `main` and decides:
    - no fragment in `.changes/unreleased` with a releasable kind (`Breaking`, `Added`, `Deprecated`, `Fixed`, `Security`, `Dependencies`): nothing is published, and the run summary says `Nothing to publish: N commits since vX.Y.Z` (or `since the seed vX.Y.Z (no release tag yet)` before the first tagged release). `Internal` fragments alone never release, but they stay in the notes of the next release;
    - a fragment with an unknown kind, or a library without a seed version in `.changes`, fails the run;
-   - otherwise `changie next auto` gives the version. The job batches the fragments (`changie batch`, `changie merge`), fails if the registry already holds that version (a wrong seed), builds and tests with `-PreleaseVersion=X.Y.Z`, commits `Release vX.Y.Z` (`CHANGELOG.md` and `.changes/`), tags `vX.Y.Z` and pushes both atomically. A failed build pushes nothing. The run summary states the version and the notes.
-2. **`publish`** checks out the tag, then checks the registry for the version's POM (`<artifact>-<version>.pom`) and Gradle module metadata (`<artifact>-<version>.module`), the two files every library publishes whatever its jar is called (spring-common and spring-events publish `<artifact>-<version>-plain.jar`). With both present it does nothing; with only one it fails and asks to delete the half-uploaded version (see recovery). Otherwise it runs `./gradlew publishToMavenLocal` with the read token, so that every dependency resolution of the publication (the jars, the POM's `versionMapping` and the module metadata) happens with a token that can read the other packages, whatever the publication is called. Then it runs `./gradlew publish -PreleaseVersion=X.Y.Z` with `GITHUB_TOKEN`.
+   - otherwise `changie next auto` gives the version. The job batches the fragments (`changie batch`, `changie merge`), fails if the registry already holds that version of `artifact`, or of any artifact in `artifacts`, naming each one (a wrong seed), builds and tests with `-PreleaseVersion=X.Y.Z`, commits `Release vX.Y.Z` (`CHANGELOG.md` and `.changes/`), tags `vX.Y.Z` and pushes both atomically. A failed build pushes nothing. The run summary states the version and the notes.
+2. **`publish`** checks out the tag, then checks the registry for the version's POM (`<artifact>-<version>.pom`) and Gradle module metadata (`<artifact>-<version>.module`), the two files every library publishes whatever its jar is called (spring-common and spring-events publish `<artifact>-<version>-plain.jar`); with `artifacts`, it checks each artifact of the list. With both files of every artifact present it does nothing; an artifact with only one of them fails the job, named, before anything is published, and the message asks to delete the half-uploaded version (see recovery). Otherwise it runs `./gradlew publishToMavenLocal` with the read token, so that every dependency resolution of the publication (the jars, the POM's `versionMapping` and the module metadata) happens with a token that can read the other packages, whatever the publication is called. With `artifacts`, it then checks that the build wrote every listed artifact at that version (see "Several artifacts"). Then it publishes with `GITHUB_TOKEN`: `./gradlew publish -PreleaseVersion=X.Y.Z` without `artifacts`; with `artifacts`, `./gradlew :<artifact>:publish … -PreleaseVersion=X.Y.Z` for the artifacts the registry does not hold yet, in the order of the list, so that a release that stopped part-way through the modules publishes only the rest.
 3. **`github-release`** creates the GitHub Release with the batch's notes, unless it exists.
 4. **`sync-branches`** merges the release commit into `dev` and `integration` through the merges API.
 5. **`notify-consumers`** sends `repository_dispatch` (`library-released`) to each consumer with the App token. The payload carries `group`, `artifact`, `version` (without `v`) and `repository` (the library's repository name).
@@ -39,6 +39,7 @@ Pushes and merges made with `GITHUB_TOKEN` start no workflows, so the release co
 |---|---|---|---|
 | `group` | string | required | Maven group id, `es.bulkynaden` or a subgroup |
 | `artifact` | string | required | Maven artifact id |
+| `artifacts` | string | `''` | newline-separated Gradle project names released together, each also its artifact id under `group`; must include `artifact`. Empty: the single-artifact release (see "Several artifacts") |
 | `consumers` | string | `''` | comma- or newline-separated repositories of the same owner to notify |
 | `sync-branches` | string | `dev integration` | space-separated branches that receive the release commit |
 | `resume-tag` | string | `''` | existing release tag to complete instead of batching (see recovery) |
@@ -64,7 +65,7 @@ Output: `version`, the released version, empty when nothing was released (also i
 - `.changie.yaml` with the kinds of ADR-0017 (`Breaking` major; `Added`, `Deprecated` minor; `Fixed`, `Security`, `Dependencies` patch; `Internal` none), `.changes/header.tpl.md` and `.changes/unreleased/.gitkeep`. The releasable kinds are also listed in the workflow's "Decide the release" step: a kind added to or removed from a library's `.changie.yaml` must change there too, in the same task.
 - A seed `.changes/v<latest published>.md`, so that changie continues from the published version.
 - changie's layout as the workflows read it: `changesDir: .changes`, `unreleasedDir: unreleased`, fragments ending in `.yaml`, `versionExt: md` (so a release's notes are `.changes/vX.Y.Z.md`) and `changelogPath: CHANGELOG.md`.
-- `build.gradle` takes its version from `-PreleaseVersion` (`0.0.0-SNAPSHOT` otherwise) and publishes with the `GITHUB_TOKEN` environment variable to the GitHub Packages registry of the repository that runs the release (`https://maven.pkg.github.com/<owner>/<this repository>`), with Gradle module metadata enabled (the default; do not disable `GenerateModuleMetadata`), because the registry checks look for `<artifact>-<version>.pom` and `.module` there.
+- `build.gradle` takes its version from `-PreleaseVersion` (`0.0.0-SNAPSHOT` otherwise) and publishes with the `GITHUB_TOKEN` environment variable to the GitHub Packages registry of the repository that runs the release (`https://maven.pkg.github.com/<owner>/<this repository>`), with Gradle module metadata enabled (the default; do not disable `GenerateModuleMetadata`), because the registry checks look for `<artifact>-<version>.pom` and `.module` there. With `artifacts`, every listed project does so, under its project name, and `publishToMavenLocal` writes to the default local Maven repository (`~/.m2/repository`: no `maven.repo.local` and no `<localRepository>`), where `publish` checks each listed artifact before uploading.
 - The organisation variable `RELEASE_APP_CLIENT_ID` and secret `RELEASE_APP_PRIVATE_KEY`, and the App installed on every consumer with Contents and Pull requests write.
 
 ### Caller
@@ -114,9 +115,49 @@ jobs:
 - common: `group: es.bulkynaden`, `artifact: common`, `consumers: spring.common,educontrol`, no `packages-read-token`.
 - spring-events: `group: es.bulkynaden.spring`, `artifact: events`, `consumers: educontrol`, with `packages-read-token`.
 
+### Several artifacts
+
+A repository that publishes several Gradle projects with one version lists them in `artifacts`, one per line; each project name is also its artifact id under `group`. They share the release: one version, one tag, one GitHub Release and one changelog.
+
+- `artifact` must be one of them, anywhere in the list. It stays the coordinate that the dispatch announces to the consumers (in `blkndn/libraries`, the BOM); the other artifacts are not announced.
+- The names are projects directly under the root project (`:<name>`): a nested project path cannot be listed.
+- `prepare` checks every name as it checks `artifact` (a lower-case artifact id, listed once) and fails when the registry already holds the version of any of them, naming each.
+- `publish` checks each artifact and publishes only the missing ones, with `./gradlew :<artifact>:publish`, in the order of the list. A project that is not listed is not published.
+- Before any upload, `publish` checks that `publishToMavenLocal` wrote `<name>-<version>.pom` and `.module` under `group` in the runner's default local Maven repository for every listed name, and fails naming each one that is missing. That catches a name that is not exactly a project's (Gradle resolves an abbreviation such as `bulkynaden-com` or `b-c` to `bulkynaden-common` and would publish that project instead), a module whose group or artifact id is not `group` and its project name, and a module that ignores `-PreleaseVersion`. The tag is already pushed by then: correct the list through the normal flow and complete the release with `resume-tag`; a module that publishes other coordinates is fixed through the normal flow and released with the next version.
+- List the BOM last: Gradle runs the publish tasks in the order of the command line (unless the build runs projects in parallel), so a release that stops part-way does not leave in the registry a BOM whose members are not published yet.
+- `resume-tag` takes the list from the caller's workflow at the ref it is dispatched from, not from the tag: resuming an older tag needs the list that tag had.
+- Empty, the default, is the single-artifact release: the registry checks cover `artifact`, and `./gradlew publish` publishes the build.
+
+`blkndn/libraries` calls it with the `on:` and `permissions:` of the caller above:
+
+```yaml
+jobs:
+  release:
+    uses: blkndn/composite/.github/workflows/library-release.yml@<full SHA of the composite tag>
+    permissions:
+      contents: write
+      packages: write
+    with:
+      group: es.bulkynaden
+      artifact: bulkynaden-bom
+      artifacts: |
+        bulkynaden-common
+        bulkynaden-spring-common
+        bulkynaden-spring-events
+        bulkynaden-bom
+      consumers: educontrol
+      resume-tag: ${{ inputs.resume-tag || '' }}
+      dry-run: ${{ inputs.dry-run == true }}
+      app-client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+    secrets:
+      app-private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+```
+
+It passes no `packages-read-token`, because its build resolves no Bulkynaden package from GitHub Packages. A caller pinned to a composite tag older than the one that added `artifacts` fails when it passes the input.
+
 ### Dry run
 
-Run the caller by hand (**Actions → Release → Run workflow**) with `dry-run` ticked. The run summary shows the version the next release would get and its batched notes, and whether the registry already holds that version. Nothing is built, committed, tagged, pushed, published, released, merged or sent: every job after `prepare` is skipped. `dry-run` together with `resume-tag` is an error.
+Run the caller by hand (**Actions → Release → Run workflow**) with `dry-run` ticked. The run summary shows the version the next release would get and its batched notes, and whether the registry already holds that version (of each artifact, with `artifacts`). Nothing is built, committed, tagged, pushed, published, released, merged or sent: every job after `prepare` is skipped. `dry-run` together with `resume-tag` is an error.
 
 A dry run reads `main`, so it shows what is already promoted. To preview what promoting `integration` would release, run on an up-to-date checkout of the library's `integration`:
 
@@ -128,11 +169,12 @@ changie batch "$(changie next auto)" --dry-run
 ### Recovery
 
 - **The build or the tests fail in `prepare`:** nothing was pushed. Fix it through the normal flow; the next push to `main` releases.
-- **A job after `prepare` fails** (`publish`, `github-release`, `sync-branches`, `notify-consumers`): use **Re-run failed jobs**. GitHub keeps `prepare`'s outputs, and every later job is idempotent: `publish` skips a version the registry already holds, the GitHub Release is not created twice, a merge with nothing to merge does nothing, and a repeated dispatch finds the bump already open.
+- **A job after `prepare` fails** (`publish`, `github-release`, `sync-branches`, `notify-consumers`): use **Re-run failed jobs**. GitHub keeps `prepare`'s outputs, and every later job is idempotent: `publish` skips what the registry already holds (with `artifacts`, artifact by artifact, so that it publishes only the missing modules), the GitHub Release is not created twice, a merge with nothing to merge does nothing, and a repeated dispatch finds the bump already open.
 - **The run was re-run with "Re-run all jobs", or the re-run window has passed:** `prepare` finds no fragments and does nothing. Run the caller by hand with `resume-tag: vX.Y.Z`. It checks that the value looks like `vX.Y.Z`, that the tag exists and is on `main`, and that its commit is named `Release vX.Y.Z`, and then runs the same idempotent jobs for that tag.
-- **A half-uploaded package version:** `publish` fails with "only partly published" when the registry holds the POM or the module metadata (`.module`) but not both, because GitHub Packages rejects a second upload of a version (HTTP 409). Delete that version in the package's settings (**Packages → the package → Manage versions**), then re-run the failed jobs or use `resume-tag`.
+- **A half-uploaded package version:** `publish` fails with "only partly published" when the registry holds the POM or the module metadata (`.module`) but not both, because GitHub Packages rejects a second upload of a version (HTTP 409). The message names the artifact; with `artifacts`, it names every half-uploaded artifact and publishes nothing until each one is deleted. Delete that version in the package's settings (**Packages → the package → Manage versions**), then re-run the failed jobs or use `resume-tag`.
+- **A re-run fails with HTTP 409 although the registry holds neither the POM nor the module metadata of an artifact:** an earlier upload of that artifact stopped after its jars. Delete that package version, then re-run the failed jobs or use `resume-tag`.
 - **`sync-branches` reports a conflict:** a released fragment or `CHANGELOG.md` was edited on `dev` or `integration`. Merge `origin/main` into a `chore/sync-release-vX.Y.Z` task branch from that branch and close it like any task.
-- **The seed guard fails** (the registry already holds the computed version): the seed in `.changes` is behind the registry. Correct the seed through the normal flow.
+- **The seed guard fails** (the registry already holds the computed version of an artifact): the seed in `.changes` is behind the registry. Correct the seed through the normal flow.
 
 ## `bump-library.yml`
 
