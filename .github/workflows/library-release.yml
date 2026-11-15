@@ -365,6 +365,28 @@ jobs:
           VERSION: ${{ needs.prepare.outputs.version }}
         run: ./gradlew publishToMavenLocal "-PreleaseVersion=$VERSION"
 
+      - name: Check that the build publishes every listed artifact
+        if: steps.registry.outputs.published != 'true' && needs.prepare.outputs.artifacts != ''
+        env:
+          GROUP: ${{ inputs.group }}
+          ARTIFACTS: ${{ needs.prepare.outputs.artifacts }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          repository="$HOME/.m2/repository"
+          echo "Local Maven repository: $repository"
+          read -ra names <<< "$ARTIFACTS"
+          absent=''
+          for name in "${names[@]}"; do
+            base="$repository/${GROUP//.//}/$name/$VERSION/$name-$VERSION"
+            if [ -f "$base.pom" ] && [ -f "$base.module" ]; then
+              echo "The build publishes $GROUP:$name:$VERSION."
+            else
+              echo "::error::The build does not publish $GROUP:$name:$VERSION: $base.pom and .module are not both in the local Maven repository. List each project by its exact name, which must also be its artifact id under group"
+              absent="$absent $name"
+            fi
+          done
+          [ -z "$absent" ]
+
       - name: Publish to GitHub Packages
         if: steps.registry.outputs.published != 'true' && needs.prepare.outputs.artifacts == ''
         env:
